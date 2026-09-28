@@ -482,7 +482,7 @@ def roadmap_complete_phases(proj, milestone):
         cols = [c.strip() for c in line.strip().strip("|").split("|")]
         if len(cols) < 4:
             continue
-        num = re.match(r"^(\d+)\.", cols[0])
+        num = re.match(r"^(\d+(?:\.\d+)*)\.", cols[0])   # 12.5. — дробная фаза, не 12
         if not num:                       # заголовок таблицы или разделитель
             continue
         if milestone and cols[1] != milestone:
@@ -493,11 +493,40 @@ def roadmap_complete_phases(proj, milestone):
     return rows
 
 
-def phase_dir_for(proj, number):
-    """Каталог фазы по номеру (`6` → `.planning/phases/06-...`), иначе None."""
-    pattern = os.path.join(proj, ".planning", "phases", f"{int(number):02d}-*")
-    hits = sorted(glob.glob(pattern))
-    return hits[0] if hits else None
+def phase_dir_for(proj, number, milestone=None):
+    """Каталог фазы по номеру (`6` → `.planning/phases/06-...`), иначе None.
+
+    Закрытая веха, по которой ещё не открыта следующая, архивирует фазы в
+    `.planning/milestones/<веха>-phases/` (gsd complete-milestone), а STATE.md
+    продолжает называть её текущей. Тогда каталог ищется и в архиве — проверка
+    отчётов идёт по архивной копии, а не пропускается.
+    """
+    head, _, frac = str(number).partition(".")
+    token = f"{int(head):02d}" + (f".{frac}" if frac else "")   # 6 → 06-*, 12.5 → 12.5-*
+    roots = [os.path.join(proj, ".planning", "phases")]
+    if milestone:
+        roots.append(os.path.join(proj, ".planning", "milestones", f"{milestone}-phases"))
+    for root in roots:
+        hits = sorted(glob.glob(os.path.join(root, f"{token}-*")))
+        if hits:
+            return hits[0]
+    return None
+
+
+def archived_verification_status(pdir):
+    """`status:` из frontmatter *-VERIFICATION.md архивной фазы; нет отчёта — `missing`."""
+    reports = sorted(glob.glob(os.path.join(pdir, "*VERIFICATION.md")))
+    if not reports:
+        return "missing"
+    try:
+        text = open(reports[0], encoding="utf-8").read()
+    except OSError:
+        return "unreadable"
+    m = re.search(r"^---\s*\n(.*?)\n---", text, re.S)
+    if not m:
+        return "no-frontmatter"
+    s = re.search(r"^status:\s*([A-Za-z_-]+)", m.group(1), re.M)
+    return s.group(1) if s else "no-status"
 
 
 def check_phase_verification(proj):
@@ -524,15 +553,22 @@ def check_phase_verification(proj):
 
     bad, unchecked, ok_n = [], [], 0
     for number, title in phases:
-        pdir = phase_dir_for(proj, number)
+        pdir = phase_dir_for(proj, number, milestone)
         if not pdir:
             unchecked.append(f"фаза {number}: каталог не найден")
             continue
-        ok, data = gsd_query(proj, "verification.status", os.path.relpath(pdir, proj))
-        if not ok:
-            unchecked.append(f"фаза {number}: gsd-tools не ответил")
-            continue
-        status = (data or {}).get("status", "?")
+        if os.sep + "milestones" + os.sep in pdir:
+            # Архив закрытой вехи: gsd-tools даёт `stale`, потому что архивация
+            # (complete-milestone) трогает файлы фазы уже после verify. Перепроверка
+            # архива невозможна по смыслу — вердикт берётся из самого отчёта,
+            # который обязан существовать и нести `status: passed`.
+            status = archived_verification_status(pdir)
+        else:
+            ok, data = gsd_query(proj, "verification.status", os.path.relpath(pdir, proj))
+            if not ok:
+                unchecked.append(f"фаза {number}: gsd-tools не ответил")
+                continue
+            status = (data or {}).get("status", "?")
         if status == "passed":
             ok_n += 1
         else:
